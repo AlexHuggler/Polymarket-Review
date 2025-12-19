@@ -13,7 +13,10 @@ ACTIVITY_URL = "https://data-api.polymarket.com/activity"
 def send_discord_alert(embed_data):
     try:
         payload = {"username": "Whale Watcher", "embeds": [embed_data]}
-        requests.post(DISCORD_WEBHOOK_URL, json=payload)
+        response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
+        if response.status_code not in {200, 204}:
+            print(f"❌ Discord Error: Status {response.status_code} - {response.text}")
+            return
         print("✅ Alert sent to Discord!")
     except Exception as e:
         print(f"❌ Discord Error: {e}")
@@ -37,6 +40,21 @@ def get_user_activity(wallet):
         print(f"⚠️ Unexpected Error: {e}")
         return []
 
+def normalize_timestamp(raw_timestamp):
+    try:
+        timestamp = int(raw_timestamp)
+    except (TypeError, ValueError):
+        return 0
+
+    if timestamp > 10**12:
+        return int(timestamp / 1000)
+    return timestamp
+
+def is_trade_activity(activity):
+    if activity.get("side") in {"BUY", "SELL"}:
+        return True
+    return activity.get("type") in {"TRADE", "MARKET_TRADE", "TRADE_FILLED"}
+
 def process_trade(activity):
     # (Same logic as before, just ensuring we capture valid data)
     try:
@@ -46,8 +64,8 @@ def process_trade(activity):
         size = float(activity.get("size", 0))
         price = float(activity.get("price", 0))
         value_usd = size * price
-        timestamp = activity.get("timestamp", 0)
-        time_str = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
+        timestamp = normalize_timestamp(activity.get("timestamp", 0))
+        time_str = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S") if timestamp else "Unknown"
         market_slug = activity.get("slug", "")
 
         color = 5763719 if side == "BUY" else 15548997
@@ -73,26 +91,39 @@ print("NOTE: If this fails immediately, you are likely blocked by your network/c
 print("Running...")
 
 initial_data = get_user_activity(TARGET_WALLET)
-last_seen_id = initial_data[0].get("id") if initial_data else None
+initial_trades = [activity for activity in initial_data if is_trade_activity(activity)]
+last_seen_timestamp = normalize_timestamp(initial_trades[0].get("timestamp")) if initial_trades else 0
+last_seen_ids = {activity.get("id") for activity in initial_trades if normalize_timestamp(activity.get("timestamp")) == last_seen_timestamp}
 
-if last_seen_id:
-    print(f"✅ Connected. Last trade ID: {last_seen_id}")
+if last_seen_timestamp:
+    print(f"✅ Connected. Last trade timestamp: {last_seen_timestamp}")
 
 while True:
     activities = get_user_activity(TARGET_WALLET)
     if activities:
-        latest_id = activities[0].get("id")
-        if latest_id != last_seen_id:
-            # Process new trades
-            new_trades = [a for a in activities if a.get("id") != last_seen_id and a.get("id") > (last_seen_id or "")]
-            # (Simple fallback if ID comparison is tricky with strings, just take top ones)
-            if not new_trades and latest_id != last_seen_id:
-                 new_trades = [activities[0]]
+        trade_activities = [activity for activity in activities if is_trade_activity(activity)]
+        new_trades = []
+        for trade in trade_activities:
+            trade_timestamp = normalize_timestamp(trade.get("timestamp"))
+            trade_id = trade.get("id")
+            if trade_timestamp > last_seen_timestamp:
+                new_trades.append(trade)
+            elif trade_timestamp == last_seen_timestamp and trade_id and trade_id not in last_seen_ids:
+                new_trades.append(trade)
 
-            for trade in new_trades:
+        if new_trades:
+            for trade in sorted(new_trades, key=lambda item: normalize_timestamp(item.get("timestamp"))):
                 print(f"New Trade: {trade.get('title')}")
                 process_trade(trade)
 
-            last_seen_id = latest_id
+            last_seen_timestamp = max(
+                last_seen_timestamp,
+                max(normalize_timestamp(trade.get("timestamp")) for trade in new_trades),
+            )
+            last_seen_ids = {
+                trade.get("id")
+                for trade in trade_activities
+                if normalize_timestamp(trade.get("timestamp")) == last_seen_timestamp
+            }
 
     time.sleep(CHECK_INTERVAL)
